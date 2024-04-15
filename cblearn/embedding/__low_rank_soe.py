@@ -194,7 +194,7 @@ def _low_rank_soe_loss_torch(embedding, triplets, margin, delta):
     X = embedding[triplets.long()]
     anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
     triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
-                                                           margin=margin, p=2, reduction='none')
+                                                           margin=margin, p=2, reduction='mean')
     nuclear_loss = torch.linalg.matrix_norm(embedding, ord='nuc')
     return delta* nuclear_loss + (1-delta)*torch.sum(triplet_loss**2)
 
