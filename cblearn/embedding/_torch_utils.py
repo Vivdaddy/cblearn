@@ -113,6 +113,108 @@ def torch_minimize(method,
         nit=n_iter + 1, success=success, message=message)
 
 
+import torch
+import numpy as np
+import scipy.optimize
+from typing import Callable, Sequence, Optional
+
+def torch_mf_minimize(method,
+                      objective: Callable, init: np.ndarray, data: Sequence, args: Sequence = [],
+                      seed: Optional[int] = None, device: str = 'auto', max_iter: int = 100,
+                      batch_size=50_000, shuffle=True, **kwargs) -> 'scipy.optimize.OptimizeResult':
+    """ PyTorch matrix factorization using alternating minimization.
+
+    This function aims to minimize the objective function using alternating minimization,
+    decomposing the initial parameter values (init) into LR^T.
+
+    Args:
+        method:
+            Optimization method, 'l-bfgs-b' or 'adam'.
+        objective:
+            Loss function to minimize.
+            Function arguments are the current parameters (L, R) and optional additional arguments.
+        init:
+            The initial parameter values as X, which will be decomposed into LR^T.
+        data:
+            Sequence of data arrays.
+        args:
+            Sequence of additional arguments, passed to the objective.
+        seed:
+            Manual seed of randomness in data sampling. Use to preserve reproducibility.
+        device:
+            Device to run the minimization on, usually "cpu" or "cuda".
+            "auto" uses "cuda", if available.
+        max_iter:
+            The maximum number of optimizer iterations (epochs).
+    Returns:
+        Dict-like object containing status and result information
+        of the optimization.
+    """
+    import torch
+
+    device = torch_device(device)
+
+    data = [torch.tensor(d).to(device) for d in data]
+    args = [torch.tensor(a).to(device) for a in args]
+    factr = 1e7 * np.finfo(float).eps
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
+                                             batch_size=batch_size, shuffle=shuffle, generator=g)
+
+    method = method.lower()
+    optimizers = {
+        'l-bfgs-b': torch.optim.LBFGS,
+        'adam': torch.optim.Adam,
+    }
+    X = torch.tensor(init, requires_grad=False, device=device)
+    
+    # Decompose X into L and R using SVD
+    U, S, V = torch.svd_lowrank(X, q=X.shape[1])
+    L = torch.matmul(U, torch.diag(S.sqrt())).requires_grad_()
+    R = torch.matmul(torch.diag(S.sqrt()), V.t()).T.requires_grad_()
+    
+    optimizer_L = optimizers[method.lower()]([L], **kwargs)
+    optimizer_R = optimizers[method.lower()]([R], **kwargs)
+
+    loss = float("inf")
+    success, message = True, ""
+    for n_iter in range(max_iter):
+        prev_loss = loss
+        loss = 0
+        for batch in dataloader:
+            def closure_L():
+                optimizer_L.zero_grad()
+                loss_L = objective(L, R, *batch, *args)
+                loss_L.backward()
+                return loss_L
+
+            def closure_R():
+                optimizer_R.zero_grad()
+                loss_R = objective(L, R, *batch, *args)
+                loss_R.backward()
+                return loss_R
+
+            loss += len(batch) * optimizer_L.step(closure_L) / len(dataloader.dataset)
+            loss += len(batch) * optimizer_R.step(closure_R) / len(dataloader.dataset)
+
+        if abs(prev_loss - loss) / max(abs(loss), abs(prev_loss), 1) < factr:
+            break
+    else:
+        success = False
+        message = f"Alternating minimization did not converge."
+
+    # Return LR^T only
+    result_LR = torch.matmul(L, R.T)
+    
+    return scipy.optimize.OptimizeResult(
+        x=result_LR.cpu().detach().numpy(), 
+        fun=loss.cpu().detach().numpy(),
+        nit=n_iter + 1, success=success, message=message)
+
+
+
 def assert_torch_is_available() -> None:
     """ Check if the torch module is installed and raise error otherwise.
 
