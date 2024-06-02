@@ -112,6 +112,291 @@ def torch_minimize(method,
         x=X.cpu().detach().numpy(), fun=loss.cpu().detach().numpy(),
         nit=n_iter + 1, success=success, message=message)
 
+def torch_hard_threshold_minimize(method,
+                   objective: Callable, init: np.ndarray, data: Sequence, args: Sequence = [],
+                   seed: Optional[int] = None, device: str = 'auto', max_iter: int = 100,
+                   batch_size=50_000, shuffle=True, beta=None, **kwargs) -> 'scipy.optimize.OptimizeResult':
+    """ Pytorch minimization routine using L-BFGS.
+
+        This function is aims to be a pytorch version of :func:`scipy.optimize.minimize`.
+
+        Args:
+            objective:
+                Loss function to minimize.
+                Function argument is the current parameters and optional additional argument.
+            init:
+                The initial parameter values.
+            data:
+                Sequence of data arrays.
+            args:
+                Sequence of additional arguments, passed to the objective.
+            seed:
+                Manual seed of randomness in data sampling. Use to preserve reproducability.
+            device:
+                Device to run the minimization on, usually "cpu" or "cuda".
+                "auto" uses "cuda", if available.
+            max_iter:
+                The maximum number of optimizer iteration (also called epochs).
+        Returns:
+            Dict-like object containing status and result information
+            of the optimization.
+    """
+    import torch
+
+    device = torch_device(device)
+
+    data = [torch.tensor(d).to(device) for d in data]
+    args = [torch.tensor(a).to(device) for a in args]
+    factr = 1e7 * np.finfo(float).eps
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
+                                             batch_size=batch_size, shuffle=shuffle, generator=g)
+
+    method = method.lower()
+    optimizers = {
+        'l-bfgs-b': torch.optim.LBFGS,
+        'adam': torch.optim.Adam,
+    }
+    X = torch.tensor(init, requires_grad=True, device=device)
+    if method.lower() in optimizers:
+        optimizer = optimizers[method.lower()]([X], **kwargs)
+    else:
+        raise ValueError(f"Expects method in {optimizers.keys()}, got {method}.")
+
+    loss = float("inf")
+    success, message = True, ""
+    for n_iter in range(max_iter):
+        prev_loss = loss
+        loss = 0
+        for batch in dataloader:
+            def closure():
+                optimizer.zero_grad()
+                loss = objective(X, *batch, *args)
+                loss.backward()
+                return loss
+
+            step_loss = optimizer.step(closure)
+            loss += len(batch) * step_loss / len(dataloader.dataset)
+
+        if abs(prev_loss - loss) / max(abs(loss), abs(prev_loss), 1) < factr:
+            break
+    else:
+        success = False
+        message = f"{method} did not converge."
+
+    # Thresholding the matrix (not sure if it is already thresholded)
+    #x = X.cpu().detach().numpy()
+    def omega_approx(b):
+        return 0.56*(b**3) - 0.95*(b**2) + 1.82*b + 1.43
+    U, s, Vh = torch.linalg.svd(X.cuda(), driver='gesvd', full_matrices=False)
+    omega = omega_approx(beta)
+    svd_threshold = torch.median(s) * omega
+    thresholded_s = torch.where(s > svd_threshold, s, torch.zeros_like(s))
+    # add a small value to avoid numerical instability
+    #thresholded_s += 1e-8
+    low_rank_X = U @ torch.diag(thresholded_s) @ Vh
+    low_rank_X = low_rank_X.cpu().detach().numpy()
+    #s = s.cpu().detach().numpy()
+    #print(f"s = {s}")
+    #print(f"low_rank_X = {low_rank_X}")
+
+    return scipy.optimize.OptimizeResult(
+        x=low_rank_X, fun=loss.cpu().detach().numpy(),
+        nit=n_iter + 1, success=success, message=message)
+
+def torch_svt_minimize(method,
+                   objective: Callable, init: np.ndarray, data: Sequence, args: Sequence = [],
+                   seed: Optional[int] = None, device: str = 'auto', max_iter: int = 100,
+                   batch_size=50_000, shuffle=True, **kwargs) -> 'scipy.optimize.OptimizeResult':
+    """ Pytorch minimization routine using L-BFGS.
+
+        This function is aims to be a pytorch version of :func:`scipy.optimize.minimize`.
+
+        Args:
+            objective:
+                Loss function to minimize.
+                Function argument is the current parameters and optional additional argument.
+            init:
+                The initial parameter values.
+            data:
+                Sequence of data arrays.
+            args:
+                Sequence of additional arguments, passed to the objective.
+            seed:
+                Manual seed of randomness in data sampling. Use to preserve reproducability.
+            device:
+                Device to run the minimization on, usually "cpu" or "cuda".
+                "auto" uses "cuda", if available.
+            max_iter:
+                The maximum number of optimizer iteration (also called epochs).
+        Returns:
+            Dict-like object containing status and result information
+            of the optimization.
+    """
+    import torch
+
+    device = torch_device(device)
+
+    data = [torch.tensor(d).to(device) for d in data]
+    args = [torch.tensor(a).to(device) for a in args]
+    factr = 1e7 * np.finfo(float).eps
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
+                                             batch_size=batch_size, shuffle=shuffle, generator=g)
+
+    method = method.lower()
+    optimizers = {
+        'l-bfgs-b': torch.optim.LBFGS,
+        'adam': torch.optim.Adam,
+    }
+    X = torch.tensor(init, requires_grad=True, device=device)
+    if method.lower() in optimizers:
+        optimizer = optimizers[method.lower()]([X], **kwargs)
+    else:
+        raise ValueError(f"Expects method in {optimizers.keys()}, got {method}.")
+
+    loss = float("inf")
+    success, message = True, ""
+    for n_iter in range(max_iter):
+        prev_loss = loss
+        loss = 0
+        for batch in dataloader:
+            def closure():
+                optimizer.zero_grad()
+                loss = objective(X, *batch, *args)
+                loss.backward()
+                return loss
+
+            step_loss = optimizer.step(closure)
+            loss += len(batch) * step_loss / len(dataloader.dataset)
+
+        if abs(prev_loss - loss) / max(abs(loss), abs(prev_loss), 1) < factr:
+            break
+    else:
+        success = False
+        message = f"{method} did not converge."
+
+    # Thresholding the matrix (not sure if it is already thresholded)
+    #x = X.cpu().detach().numpy()
+    U, s, Vh = torch.linalg.svd(X.cuda(), driver='gesvd', full_matrices=False)
+    threshold = args[-1]
+    thresholded_s = torch.where(s > threshold, s, torch.zeros_like(s))
+    # add a small value to avoid numerical instability
+    thresholded_s += 1e-8
+    low_rank_X = U @ torch.diag(thresholded_s) @ Vh
+    low_rank_X = low_rank_X.cpu().detach().numpy()
+    s = s.cpu().detach().numpy()
+    #print(f"s = {s}")
+    #print(f"low_rank_X = {low_rank_X}")
+
+    return scipy.optimize.OptimizeResult(
+        x=low_rank_X, fun=loss.cpu().detach().numpy(),
+        nit=n_iter + 1, success=success, message=message)
+
+def torch_qr_minimize(method,
+                   objective: Callable, init: np.ndarray, data: Sequence, args: Sequence = [],
+                   seed: Optional[int] = None, device: str = 'auto', max_iter: int = 100,
+                   batch_size=50_000, shuffle=True, **kwargs) -> 'scipy.optimize.OptimizeResult':
+    """ Pytorch minimization routine using L-BFGS.
+
+        This function is aims to be a pytorch version of :func:`scipy.optimize.minimize`.
+
+        Args:
+            objective:
+                Loss function to minimize.
+                Function argument is the current parameters and optional additional argument.
+            init:
+                The initial parameter values.
+            data:
+                Sequence of data arrays.
+            args:
+                Sequence of additional arguments, passed to the objective.
+            seed:
+                Manual seed of randomness in data sampling. Use to preserve reproducability.
+            device:
+                Device to run the minimization on, usually "cpu" or "cuda".
+                "auto" uses "cuda", if available.
+            max_iter:
+                The maximum number of optimizer iteration (also called epochs).
+        Returns:
+            Dict-like object containing status and result information
+            of the optimization.
+    """
+    import torch
+
+    device = torch_device(device)
+
+    data = [torch.tensor(d).to(device) for d in data]
+    args = [torch.tensor(a).to(device) for a in args]
+    factr = 1e7 * np.finfo(float).eps
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    dataloader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(*data),
+                                             batch_size=batch_size, shuffle=shuffle, generator=g)
+
+    method = method.lower()
+    optimizers = {
+        'l-bfgs-b': torch.optim.LBFGS,
+        'adam': torch.optim.Adam,
+    }
+    X = torch.tensor(init, requires_grad=True, device=device)
+    if method.lower() in optimizers:
+        optimizer = optimizers[method.lower()]([X], **kwargs)
+    else:
+        raise ValueError(f"Expects method in {optimizers.keys()}, got {method}.")
+
+    loss = float("inf")
+    success, message = True, ""
+    for n_iter in range(max_iter):
+        prev_loss = loss
+        loss = 0
+        for batch in dataloader:
+            def closure():
+                optimizer.zero_grad()
+                loss = objective(X, *batch, *args)
+                loss.backward()
+                return loss
+
+            step_loss = optimizer.step(closure)
+            loss += len(batch) * step_loss / len(dataloader.dataset)
+
+        if abs(prev_loss - loss) / max(abs(loss), abs(prev_loss), 1) < factr:
+            break
+    else:
+        success = False
+        message = f"{method} did not converge."
+
+    # Thresholding the matrix (not sure if it is already thresholded)
+    #X = X.cpu().detach().numpy()
+
+    Q, R = torch.linalg.qr(X.cuda())
+    # Calculate relative threshold
+    R_norm = torch.linalg.norm(R, ord='fro')
+    # t_val = torch.min(args[-1], torch.Tensor(0.2))
+    # FIXME: This is a hack. Need to find a better way to ensure threshold doesnt break
+    relative_threshold = args[-1] * R_norm
+    diag_abs = torch.abs(torch.diagonal(R, 0))
+    k = torch.sum(diag_abs > relative_threshold)
+    if k>1:
+        # Truncate Q and R
+        Q_trunc = Q[:, :k]
+        R_trunc = R[:k, :]
+    else:
+        # All elements become zero
+        Q_trunc = Q[:, :1]
+        R_trunc = R[:1, :]
+    low_rank_X = Q_trunc @ R_trunc
+    low_rank_X = low_rank_X.cpu().detach().numpy()
+
+    return scipy.optimize.OptimizeResult(
+        x=low_rank_X, fun=loss.cpu().detach().numpy(),
+        nit=n_iter + 1, success=success, message=message)
+
 
 import torch
 import numpy as np
@@ -203,7 +488,7 @@ def torch_mf_minimize(method,
             break
     else:
         success = False
-        message = f"Alternating minimization did not converge."
+        message = "Alternating minimization did not converge."
 
     # Return LR^T only
     result_LR = torch.matmul(L, R.T)

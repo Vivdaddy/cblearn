@@ -9,7 +9,7 @@ from scipy.linalg import svd
 
 from cblearn import utils
 from cblearn.embedding._base import TripletEmbeddingMixin
-from cblearn.embedding._torch_utils import assert_torch_is_available, torch_minimize, torch_mf_minimize
+from cblearn.embedding._torch_utils import assert_torch_is_available, torch_minimize, torch_mf_minimize, torch_svt_minimize, torch_qr_minimize, torch_hard_threshold_minimize
 
 
 class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
@@ -67,7 +67,7 @@ class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
                Insights into Ordinal Embedding Algorithms: A Systematic Evaluation. ArXiv:1912.01666 [Cs, Stat].
         """
 
-    def __init__(self, n_components=2, margin=0.1, delta=0.1, method="Vanilla", n_init=10, verbose=False,
+    def __init__(self, n_components=2, margin=0.1, delta=0.1, method="Vanilla", n_init=10, threshold=0.5, verbose=False,
                  random_state: Union[None, int, np.random.RandomState] = None, max_iter=1000,
                  restart_optim: int = 10, backend: str = "scipy",
                  learning_rate=1, batch_size=50_000,  device: str = "auto"):
@@ -79,9 +79,10 @@ class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
             margin: Scale parameter which only takes strictly positive value.
                 Defines the intended minimal difference of distances in the embedding space between
                 for any triplet.
-            delta: How much to weight the low-rank constraint. (Between 0 and 1, default=0.1)
-            method: The method/loss function to use for the optimization. {"Vanilla", "MF", "Weighted"}
+            delta: How much to weight the low-rank constraint. (default=0.1)
+            method: The method/loss function to use for the optimization. {"Vanilla", "MF", "Weighted", "SVT"}
             n_init: repeat the optimization procedure n_init times.
+            threshold: How much to do threshold on singular values. Ignored if method is not 'SVT'
             verbose: boolean, default=False
                 Enable verbose output.
             random_state:
@@ -103,10 +104,12 @@ class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
         self.n_components = n_components
         self.margin = margin
         self.delta = delta
+        self.beta = None
         self.method = method
         self.n_init = n_init
         self.max_iter = max_iter
         self.restart_optim = restart_optim
+        self.threshold = threshold
         self.verbose = verbose
         self.random_state = random_state
         self.backend = backend
@@ -114,15 +117,15 @@ class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
         self.batch_size = batch_size
         self.device = device
 
-        if type(self.delta) not in [int, float] or not 0 <= self.delta <= 1:
-            raise ValueError(f"delta must be a float between 0 and 1, got {self.delta}.")
+        if type(self.delta) not in [int, float]:
+            raise ValueError(f"delta must be a float got {self.delta}.")
         
         # Type check for method and if only available methods are used
         # Type check that method is a string
         if not isinstance(self.method, str):
             raise TypeError(f"method must be a string, got {type(self.method)}.")
-        if self.method not in ["Vanilla", "MF", "Weighted"]:
-            raise ValueError(f"Unknown method '{self.method}'. Try 'Vanilla', 'MF' or 'Weighted' instead.")
+        if self.method not in ["Vanilla", "MF", "Weighted", "SVT", "SVT_reconstruction", "Vanilla_SVT", "RRQR", "Hard_thresholding"]:
+            raise ValueError(f"Unknown method '{self.method}'. Try 'Vanilla', 'MF', 'Weighted', 'SVT', 'SVT_reconstruction','Vanilla_SVT', 'RRQR' or 'Hard_thresholding' instead.")
 
     def fit(self, X: utils.Query, y: np.ndarray = None, init: np.ndarray = None,
             n_objects: Optional[int] = None) -> 'LowRankSOE':
@@ -158,31 +161,62 @@ class LowRankSOE(BaseEstimator, TripletEmbeddingMixin):
                 assert_torch_is_available()
                 if queries.shape[1] != 3:
                     raise ValueError(f"Expect triplets of shape (n_triplets, 3), got {queries.shape}.")
-                if self.method is "Vanilla":
+                if self.method == "Vanilla":
                     result = torch_minimize('adam', _low_rank_soe_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.delta),
                                         device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
                                         seed=random_state.randint(1))
-                elif self.method is "Weighted":
+                elif self.method == "Weighted":
                     result = torch_minimize('adam', _weighted_low_rank_soe_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.delta),
                                         device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
                                         seed=random_state.randint(1))
-                elif self.method is "MF":
+                elif self.method == "MF":
                     result = torch_mf_minimize('adam', _low_rank_mf_soe_loss, init, data=(queries.astype(int),), args=(self.margin, self.delta),
                                         device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
                                         seed=random_state.randint(1))
+                elif self.method == "SVT":
+                    result = torch_svt_minimize('adam', _low_rank_soe_svt_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.threshold),
+                                        device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
+                                        seed=random_state.randint(1))
+                elif self.method == "SVT_reconstruction":
+                    result = torch_svt_minimize('adam', _low_rank_soe_svt_reconstruction_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.threshold),
+                                        device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
+                                        seed=random_state.randint(1))
+                elif self.method == "Vanilla_SVT":
+                    result = torch_svt_minimize('adam', _low_rank_soe_svt_nuc_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.delta, self.threshold),
+                                        device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
+                                        seed=random_state.randint(1))
+                elif self.method == "RRQR":
+                    result = torch_qr_minimize('adam', _low_rank_soe_qr_loss_torch, init, data=(queries.astype(int),), args=(self.margin, self.delta, self.threshold),
+                                        device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
+                                        seed=random_state.randint(1))
+                elif self.method == "Hard_thresholding":
+                    self.beta = self.n_components / n_objects
+                    result = torch_hard_threshold_minimize('adam', _soe_loss_torch, init, data=(queries.astype(int),), args=(self.margin,),
+                                        device=self.device, max_iter=self.max_iter, lr=self.learning_rate,
+                                        seed=random_state.randint(1), beta=self.beta)
+
+                    
             elif self.backend == "scipy":
                 if queries.shape[1] == 3:
                     queries = queries[:, [0, 1, 0, 2]]
                 elif queries.shape[1] != 4:
                     raise ValueError(f"Expect triplets or quadruplets of shape (n_queries, 3/4), got {queries.shape}.")
-                if self.method is "Vanilla":
+                if self.method == "Vanilla":
                     result = minimize(_low_rank_soe_loss, init.ravel(), args=(init.shape, queries, self.margin, self.delta), method='L-BFGS-B',
                                   jac=True, options=dict(maxiter=self.max_iter, disp=self.verbose))
-                elif self.method is "Weighted":
+                elif self.method == "Weighted":
                     result = minimize(_weighted_low_rank_soe_loss, init.ravel(), args=(init.shape, queries, self.margin, self.delta), method='L-BFGS-B',
                                   jac=True, options=dict(maxiter=self.max_iter, disp=self.verbose))
-                elif self.method is "MF":
+                elif self.method == "MF":
                     raise NotImplementedError("Matrix Factorization optimization is not implemented for the scipy backend.")
+                elif self.method == "SVT":
+                    raise NotImplementedError("SVT optimization is not implemented for the scipy backend.")
+                elif self.method == "SVT_reconstruction":
+                    raise NotImplementedError("SVT reconstruction optimization is not implemented for the scipy backend.")
+                elif self.method == "Vanilla_SVT":
+                    raise NotImplementedError("Vanilla SVT optimization is not implemented for the scipy backend.")
+                elif self.method == "RRQR":
+                    raise NotImplementedError("RRQR optimization is not implemented for the scipy backend.")
 
             else:
                 raise ValueError(f"Unknown backend '{self.backend}'. Try 'scipy' or 'torch' instead.")
@@ -208,6 +242,116 @@ def _soe_loss_torch(embedding, triplets, margin):
                                                            margin=margin, p=2, reduction='none')
     return torch.sum(triplet_loss**2)
 
+def _low_rank_soe_svt_reconstruction_loss_torch(embedding, triplets, margin, threshold):
+    """ ModifiedEquation (1) of Terada & Luxburg (2014) with thresholding
+        of the singular values of the embedding to promote low rank solution
+    SOE_Loss(SVT(embedding), triplets, margin) + ||embedding - SVT(embedding)||_2^2
+    """
+    import torch
+
+    # Apply SVT to the embedding matrix
+    embedding = embedding.cuda()
+    U, Sigma, Vh = torch.linalg.svd(embedding, driver='gesvd', full_matrices=False)  # Use 'gesvd' driver for numerical stability [1][3]
+    # Hard thresholding
+    Sigma_thr = torch.where(Sigma > threshold, Sigma, torch.zeros_like(Sigma))
+    # Soft thresholding
+    #Sigma_thr = torch.max(Sigma - threshold, torch.zeros_like(Sigma))
+    embedding_low_rank = U @ torch.diag(Sigma_thr) @ Vh
+
+    X = embedding_low_rank[triplets.long()]
+    anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
+    triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
+                                                           margin=margin, p=2, reduction='mean')
+
+    # Don't need to penalize with nuclear norm because of thresholding
+    #nuclear_loss = torch.linalg.matrix_norm(embedding_low_rank, ord='nuc')
+    # Adding a reconstruction loss between the original embedding and the low-rank embedding
+    reconstruction_loss = torch.nn.functional.mse_loss(embedding, embedding_low_rank, reduction='mean')
+    return reconstruction_loss + torch.sum(triplet_loss ** 2)
+
+def _low_rank_soe_qr_loss_torch(embedding, triplets, margin, delta, tol):
+    """ModifiedEquation (1) of Terada & Luxburg (2014) with QR decomposition
+        and RRQR decomposition with relative thresholding to promote low-rank solution
+        SOE_Loss(RRQR(embedding), triplets, margin)
+    """
+    import torch
+    # Apply RRQR to the embedding matrix
+    m, n = embedding.shape
+    embedding = embedding.cuda()
+    Q, R = torch.linalg.qr(embedding)
+    # Calculate relative threshold
+    R_norm = torch.linalg.norm(R, ord='fro')
+    relative_threshold = tol * R_norm
+    diag_abs = torch.abs(torch.diagonal(R, 0))
+    # Rank of the matrix
+    k = torch.sum(diag_abs > relative_threshold)
+    # Truncate Q and R
+    Q_trunc = Q[:, :k]
+    R_trunc = R[:k, :]
+    # Embedding Low Rank
+    embedding_low_rank = Q_trunc @ R_trunc
+    X = embedding_low_rank[triplets.long()]
+    anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
+    triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
+                                                           margin=margin, p=2, reduction='mean')
+    
+    # Penalize Last few singular values to be smaller than delta
+    diff_to_delta = torch.linalg.svdvals(embedding_low_rank)[k:] - delta
+    elemwise_penalty = torch.clamp(diff_to_delta, min=0)
+
+    return torch.sum(triplet_loss ** 2) + torch.sum(elemwise_penalty)
+
+
+def _low_rank_soe_svt_loss_torch(embedding, triplets, margin, threshold):
+    """ ModifiedEquation (1) of Terada & Luxburg (2014) with thresholding
+        of the singular values of the embedding to promote low rank solution
+    SOE_Loss(SVT(embedding), triplets, margin)
+    """
+    import torch
+
+    # Apply SVT to the embedding matrix
+    embedding = embedding.cuda()
+    U, Sigma, Vh = torch.linalg.svd(embedding, driver='gesvd', full_matrices=False)  # Use 'gesvd' driver for numerical stability [1][3]
+    # Hard thresholding
+    Sigma_thr = torch.where(Sigma > threshold, Sigma, torch.zeros_like(Sigma))
+    # Soft thresholding
+    #Sigma_thr = torch.max(Sigma - threshold, torch.zeros_like(Sigma))
+    embedding_low_rank = U @ torch.diag(Sigma_thr) @ Vh
+
+    X = embedding_low_rank[triplets.long()]
+    anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
+    triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
+                                                           margin=margin, p=2, reduction='none')
+
+    # Don't need to penalize with nuclear norm because of thresholding
+    #nuclear_loss = torch.linalg.matrix_norm(embedding_low_rank, ord='nuc')
+    return torch.sum(triplet_loss ** 2)
+
+def _low_rank_soe_svt_nuc_loss_torch(embedding, triplets, margin, delta, threshold):
+    """ ModifiedEquation (1) of Terada & Luxburg (2014) with thresholding
+        of the singular values of the embedding to promote low rank solution
+        SOE_Loss(SVT(embedding), triplets, margin) + ||SVT(embedding)||_*
+    """
+    import torch
+
+    # Apply SVT to the embedding matrix
+    embedding = embedding.cuda()
+    U, Sigma, Vh = torch.linalg.svd(embedding, driver='gesvd', full_matrices=False)  # Use 'gesvd' driver for numerical stability [1][3]
+    # Hard thresholding
+    Sigma_thr = torch.where(Sigma > threshold, Sigma, torch.zeros_like(Sigma))
+    # Soft thresholding
+    #Sigma_thr = torch.max(Sigma - threshold, torch.zeros_like(Sigma))
+    embedding_low_rank = U @ torch.diag(Sigma_thr) @ Vh
+
+    X = embedding_low_rank[triplets.long()]
+    anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
+    triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
+                                                           margin=margin, p=2, reduction='mean')
+
+    # Don't need to penalize with nuclear norm because of thresholding
+    nuclear_loss = torch.linalg.matrix_norm(embedding_low_rank, ord='nuc')
+    return torch.sum(triplet_loss ** 2) + delta * nuclear_loss
+
 def _low_rank_mf_soe_loss(L, R, triplets, margin, delta):
     """ ModifiedEquation (1) of Terada & Luxburg (2014) with low-rank constraint
         But solving via a matrix factorization approach X = LR^T
@@ -226,7 +370,7 @@ def _low_rank_mf_soe_loss(L, R, triplets, margin, delta):
     
     # Low-rank constraint
     nuclear_loss = torch.linalg.matrix_norm(L, ord='fro')**2 + torch.linalg.matrix_norm(R, ord='fro')**2
-    return (delta / 2) * nuclear_loss + (1-delta) * torch.sum(triplet_loss**2)
+    return (delta / 2) * nuclear_loss + torch.sum(triplet_loss**2)
 
 
 def _weighted_low_rank_soe_loss_torch(embedding, triplets, margin, delta):
@@ -237,12 +381,13 @@ def _weighted_low_rank_soe_loss_torch(embedding, triplets, margin, delta):
     import torch  # Pytorch is an optional dependency
 
     X = embedding[triplets.long()]
+    m, n = embedding.shape
     anchor, positive, negative = X[:, 0, :], X[:, 1, :], X[:, 2, :]
     triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
                                                            margin=margin, p=2, reduction='mean')
     svd_values = torch.linalg.svdvals(embedding)
     weighted_svd_values = torch.abs(svd_values) * (torch.arange(1, len(svd_values)+1)**2)
-    return delta * weighted_svd_values.sum() / (10*torch.max(svd_values)) + (1-delta) * torch.sum(triplet_loss**2)
+    return delta * weighted_svd_values.sum() / (n*torch.max(weighted_svd_values)) + torch.sum(triplet_loss**2)
 
 def _low_rank_soe_loss_torch(embedding, triplets, margin, delta):
     """ ModifiedEquation (1) of Terada & Luxburg (2014) with low-rank constraint 
@@ -256,7 +401,7 @@ def _low_rank_soe_loss_torch(embedding, triplets, margin, delta):
     triplet_loss = torch.nn.functional.triplet_margin_loss(anchor, positive, negative,
                                                            margin=margin, p=2, reduction='mean')
     nuclear_loss = torch.linalg.matrix_norm(embedding, ord='nuc')
-    return delta* nuclear_loss + (1-delta)*torch.sum(triplet_loss**2)
+    return delta* nuclear_loss + torch.sum(triplet_loss**2)
 
 def _weighted_low_rank_soe_loss(x, x_shape, quadruplet, margin, delta):
     """ Loss equation (1) of Terada & Luxburg (2014)
